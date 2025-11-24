@@ -6,24 +6,26 @@ from collections import Counter
 from typing import Dict, Iterable, Iterator, List, Tuple
 
 import numpy as np
+import torch
 import xxhash
+from FlagEmbedding import FlagAutoModel
 from pymilvus import (
+    AnnSearchRequest,
     Collection,
     CollectionSchema,
     DataType,
     FieldSchema,
+    WeightedRanker,
     connections,
     utility,
 )
-from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
-
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-logger = logging.getLogger("milvus_ingest")
+logger = logging.getLogger("milvus_bge_ingest")
 
 # ----------------------- Runtime configuration -----------------------
 MILVUS_HOST = os.getenv("MILVUS_HOST", "1.92.82.153")
@@ -31,20 +33,22 @@ MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
 MILVUS_DB = os.getenv("MILVUS_DB", "peng")
 MILVUS_ALIAS = os.getenv("MILVUS_ALIAS", "peng_conn")
 COLLECTION_NAME = os.getenv("MILVUS_COLLECTION", "clapnq")
-DROP_COLLECTION = os.getenv("DROP_COLLECTION", "true").lower() == "true"
+DROPPED = os.getenv("DROP_COLLECTION", "true").lower() == "true"
 
 JSONL_PATH = os.getenv(
     "JSONL_PATH",
     os.path.join(os.path.dirname(__file__), "4_corporas_test_40.jsonl"),
 )
 
-BGE_MODEL_NAME = os.getenv("BGE_MODEL_NAME", "BAAI/bge-large-zh-v1.5")
-BGE_DEVICE = os.getenv("BGE_DEVICE")
-BGE_BATCH_SIZE = int(os.getenv("BGE_BATCH_SIZE", "128"))
-INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "512"))
+BGE_MODEL_NAME = os.getenv("BGE_MODEL_NAME", "BAAI/bge-small-en")
+BGE_BATCH_SIZE = int(os.getenv("BGE_BATCH_SIZE", "256"))
+INSERT_BATCH_SIZE = int(os.getenv("INSERT_BATCH_SIZE", "1000"))
+NORMALIZE_EMBED = os.getenv("NORMALIZE_EMBED", "true").lower() == "true"
 
 BM25_K1 = float(os.getenv("BM25_K1", "1.2"))
 BM25_B = float(os.getenv("BM25_B", "0.75"))
+
+RUN_SEARCH_TEST = os.getenv("RUN_SEARCH_TEST", "false").lower() == "true"
 
 
 # ----------------------------- Helpers ------------------------------
@@ -133,7 +137,7 @@ def batched(iterator: Iterable[Dict[str, str]], batch_size: int) -> Iterator[Lis
 
 
 def encode_with_bge(
-    model: SentenceTransformer,
+    model: FlagAutoModel,
     texts: List[str],
     batch_size: int,
 ) -> List[List[float]]:
@@ -141,11 +145,19 @@ def encode_with_bge(
         texts,
         batch_size=batch_size,
         show_progress_bar=False,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
     )
+    if isinstance(embeddings, torch.Tensor):
+        embeddings = embeddings.detach().cpu().numpy()
     embeddings = np.asarray(embeddings, dtype=np.float32)
+    if NORMALIZE_EMBED:
+        embeddings = _l2_normalize(embeddings)
     return embeddings.tolist()
+
+
+def _l2_normalize(arr: np.ndarray) -> np.ndarray:
+    arr = arr.astype(np.float32)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-12
+    return arr / norms
 
 
 def ensure_database() -> None:
@@ -173,10 +185,11 @@ def connect_milvus() -> None:
 
 def ensure_collection(dense_dim: int) -> Collection:
     if utility.has_collection(COLLECTION_NAME, using=MILVUS_ALIAS):
-        if DROP_COLLECTION:
+        if DROPPED:
             logger.info("删除已有集合 %s", COLLECTION_NAME)
             utility.drop_collection(COLLECTION_NAME, using=MILVUS_ALIAS)
         else:
+            logger.info("沿用已有集合 %s", COLLECTION_NAME)
             return Collection(name=COLLECTION_NAME, using=MILVUS_ALIAS)
 
     fields = [
@@ -208,7 +221,7 @@ def ensure_collection(dense_dim: int) -> Collection:
 
 def insert_batches(
     collection: Collection,
-    model: SentenceTransformer,
+    model: FlagAutoModel,
     idf: Dict[str, float],
     avgdl: float,
     doc_count: int,
@@ -258,13 +271,64 @@ def create_indexes(collection: Collection) -> None:
     collection.load()
 
 
+def hybrid_search(
+    collection: Collection,
+    model: FlagAutoModel,
+    query: str,
+    idf: Dict[str, float],
+    avgdl: float,
+    top_k: int = 5,
+    alpha: float = 0.6,
+) -> List[Tuple[str, float, str]]:
+    dense_vec = encode_with_bge(model, [query], batch_size=1)[0]
+    sparse_vec = bm25_doc_vector(simple_tokenize(query), idf, avgdl)
+
+    dense_req = AnnSearchRequest(
+        data=[dense_vec],
+        anns_field="dense_embedding",
+        param={"metric_type": "IP", "params": {}},
+        limit=top_k,
+    )
+    sparse_req = AnnSearchRequest(
+        data=[sparse_vec],
+        anns_field="sparse_embedding",
+        param={"metric_type": "IP", "params": {}},
+        limit=top_k,
+    )
+    rerank = WeightedRanker(alpha, 1.0 - alpha)
+    results = collection.hybrid_search(
+        reqs=[dense_req, sparse_req],
+        rerank=rerank,
+        limit=top_k,
+        output_fields=["title", "text"],
+    )
+
+    hits = []
+    for hit in results[0]:
+        hits.append(
+            (
+                hit.entity.get("title") or "",
+                hit.score,
+                hit.entity.get("text")[:200],
+            )
+        )
+    return hits
+
+
 def main() -> None:
     if not os.path.exists(JSONL_PATH):
         raise FileNotFoundError(f"找不到 JSONL 文件：{JSONL_PATH}")
 
     logger.info("加载 BGE 模型：%s", BGE_MODEL_NAME)
-    model = SentenceTransformer(BGE_MODEL_NAME, device=BGE_DEVICE)
-    dense_dim = model.get_sentence_embedding_dimension()
+    model = FlagAutoModel.from_finetuned(
+        BGE_MODEL_NAME,
+        use_fp16=torch.cuda.is_available(),
+    )
+    dense_dim = getattr(model, "get_sentence_embedding_dimension", None)
+    if callable(dense_dim):
+        dense_dim = dense_dim()
+    else:
+        dense_dim = len(encode_with_bge(model, ["dimension_probe"], 1)[0])
     logger.info("向量维度：%d", dense_dim)
 
     connect_milvus()
@@ -278,6 +342,21 @@ def main() -> None:
     create_indexes(collection)
 
     logger.info("数据导入与索引构建完成")
+
+    if RUN_SEARCH_TEST:
+        collection.load()
+        demo_queries = [
+            "What happened after the French Revolution?",
+            "How does machine learning work?",
+            "Tell me about climate change",
+        ]
+        for query in demo_queries:
+            logger.info("Hybrid search: %s", query)
+            for idx, (title, score, snippet) in enumerate(
+                hybrid_search(collection, model, query, idf, avgdl), start=1
+            ):
+                print(f"{idx}. [{score:.4f}] {title}\n   {snippet}...\n")
+            print("-" * 80)
 
 
 if __name__ == "__main__":
