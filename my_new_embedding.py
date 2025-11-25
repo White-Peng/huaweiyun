@@ -32,6 +32,7 @@ logger = logging.getLogger("milvus_bge_pipeline")
 # ----------------------------------------------------------------------
 BGE_CHUNK_MAX_TOKENS = int(os.getenv("CHUNK_MAX_TOKENS", "512"))
 BGE_CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP_TOKENS", "64"))
+BGE_CHUNK_SPECIAL_BUFFER = int(os.getenv("CHUNK_SPECIAL_TOKENS", "2"))
 
 MILVUS_HOST = os.getenv("MILVUS_HOST", "1.92.82.153")
 MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
@@ -120,6 +121,7 @@ def chunk_text(
     max_tokens: int,
     overlap_tokens: int,
 ) -> List[str]:
+    effective_max = max(max_tokens - BGE_CHUNK_SPECIAL_BUFFER, 1)
     encoded = tokenizer(
         text,
         add_special_tokens=False,
@@ -130,13 +132,13 @@ def chunk_text(
     if not token_ids:
         return []
 
-    if len(token_ids) <= max_tokens:
+    if len(token_ids) <= effective_max:
         return [text]
 
     chunks: List[str] = []
-    step = max(max_tokens - overlap_tokens, 1)
+    step = max(effective_max - overlap_tokens, 1)
     for start in range(0, len(token_ids), step):
-        end = min(start + max_tokens, len(token_ids))
+        end = min(start + effective_max, len(token_ids))
         chunk_ids = token_ids[start:end]
         chunk = tokenizer.decode(chunk_ids, skip_special_tokens=True).strip()
         if chunk:
