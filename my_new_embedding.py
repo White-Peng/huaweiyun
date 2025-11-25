@@ -30,6 +30,9 @@ logger = logging.getLogger("milvus_bge_pipeline")
 # ----------------------------------------------------------------------
 # Runtime configuration (override via environment variables)
 # ----------------------------------------------------------------------
+BGE_CHUNK_MAX_TOKENS = int(os.getenv("CHUNK_MAX_TOKENS", "512"))
+BGE_CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP_TOKENS", "64"))
+
 MILVUS_HOST = os.getenv("MILVUS_HOST", "1.92.82.153")
 MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
 MILVUS_DB = os.getenv("MILVUS_DB", "peng")
@@ -84,7 +87,7 @@ def bm25_doc_vector(
     return vec
 
 
-def iter_jsonl(path: str) -> Iterator[Dict[str, str]]:
+def iter_documents(path: str) -> Iterator[Dict[str, str]]:
     with open(path, "r", encoding="utf-8") as f:
         for line_no, raw_line in enumerate(f, start=1):
             line = raw_line.strip()
@@ -111,12 +114,72 @@ def iter_jsonl(path: str) -> Iterator[Dict[str, str]]:
             yield {"id": str(doc_id), "title": title, "text": text}
 
 
-def scan_corpus_for_stats(path: str) -> Tuple[Dict[str, float], float, int]:
+def chunk_text(
+    text: str,
+    tokenizer,
+    max_tokens: int,
+    overlap_tokens: int,
+) -> List[str]:
+    encoded = tokenizer(
+        text,
+        add_special_tokens=False,
+        return_attention_mask=False,
+        return_token_type_ids=False,
+    )
+    token_ids = encoded["input_ids"]
+    if not token_ids:
+        return []
+
+    if len(token_ids) <= max_tokens:
+        return [text]
+
+    chunks: List[str] = []
+    step = max(max_tokens - overlap_tokens, 1)
+    for start in range(0, len(token_ids), step):
+        end = min(start + max_tokens, len(token_ids))
+        chunk_ids = token_ids[start:end]
+        chunk = tokenizer.decode(chunk_ids, skip_special_tokens=True).strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= len(token_ids):
+            break
+    return chunks
+
+
+def iter_chunks(
+    path: str,
+    tokenizer,
+    max_tokens: int,
+    overlap_tokens: int,
+) -> Iterator[Dict[str, str]]:
+    for doc in iter_documents(path):
+        parts = chunk_text(doc["text"], tokenizer, max_tokens, overlap_tokens)
+        if not parts:
+            continue
+        if len(parts) == 1:
+            yield {"id": doc["id"], "title": doc["title"], "text": parts[0]}
+            continue
+        for idx, chunk in enumerate(parts):
+            chunk_id = f"{doc['id']}_{idx}"
+            title = doc["title"]
+            chunk_title = f"{title} [part {idx + 1}]" if title else chunk_id
+            yield {"id": chunk_id, "title": chunk_title, "text": chunk}
+
+
+def scan_corpus_for_stats(
+    path: str,
+    tokenizer,
+    max_tokens: int,
+    overlap_tokens: int,
+) -> Tuple[Dict[str, float], float, int]:
     df = Counter()
     total_len = 0
     doc_count = 0
 
-    for doc in tqdm(iter_jsonl(path), desc="Pass 1/2: 统计 BM25 信息"):
+    for doc in tqdm(
+        iter_chunks(path, tokenizer, max_tokens, overlap_tokens),
+        desc="Pass 1/2: 统计 BM25 信息",
+    ):
         tokens = simple_tokenize(doc["text"])
         doc_count += 1
         total_len += len(tokens)
@@ -235,9 +298,12 @@ def ensure_collection(dense_dim: int) -> Collection:
 def insert_batches(
     collection: Collection,
     model: FlagAutoModel,
+    tokenizer,
     idf: Dict[str, float],
     avgdl: float,
     doc_count: int,
+    max_tokens: int,
+    overlap_tokens: int,
 ) -> None:
     if doc_count == 0:
         logger.warning("没有可导入的数据，直接退出")
@@ -246,7 +312,8 @@ def insert_batches(
     progress = tqdm(total=doc_count, desc="Pass 2/2: 嵌入 + 插入 Milvus")
     total_inserted = 0
 
-    for batch in batched(iter_jsonl(JSONL_PATH), INSERT_BATCH_SIZE):
+    chunk_iter = iter_chunks(JSONL_PATH, tokenizer, max_tokens, overlap_tokens)
+    for batch in batched(chunk_iter, INSERT_BATCH_SIZE):
         texts = [doc["text"] for doc in batch]
         titles = [doc["title"] for doc in batch]
         ids = [doc["id"] for doc in batch]
@@ -337,6 +404,9 @@ def main() -> None:
         BGE_MODEL_NAME,
         use_fp16=torch.cuda.is_available(),
     )
+    tokenizer = getattr(model, "tokenizer", None)
+    if tokenizer is None:
+        raise RuntimeError("无法从 BGE 模型中获取 tokenizer")
     dense_dim_fn = getattr(model, "get_sentence_embedding_dimension", None)
     if callable(dense_dim_fn):
         dense_dim = dense_dim_fn()
@@ -348,10 +418,24 @@ def main() -> None:
     collection = ensure_collection(dense_dim)
 
     logger.info("开始扫描语料以计算 BM25 统计")
-    idf, avgdl, doc_count = scan_corpus_for_stats(JSONL_PATH)
-    logger.info("语料文档数：%d，平均长度：%.2f", doc_count, avgdl)
+    idf, avgdl, doc_count = scan_corpus_for_stats(
+        JSONL_PATH,
+        tokenizer,
+        BGE_CHUNK_MAX_TOKENS,
+        BGE_CHUNK_OVERLAP,
+    )
+    logger.info("语料（含切片）数量：%d，平均长度：%.2f", doc_count, avgdl)
 
-    insert_batches(collection, model, idf, avgdl, doc_count)
+    insert_batches(
+        collection,
+        model,
+        tokenizer,
+        idf,
+        avgdl,
+        doc_count,
+        BGE_CHUNK_MAX_TOKENS,
+        BGE_CHUNK_OVERLAP,
+    )
     create_indexes(collection)
 
     logger.info("数据导入与索引构建完成")
